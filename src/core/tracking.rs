@@ -364,7 +364,8 @@ type CommandStats = (String, usize, usize, f64, u64);
 /// an unfiltered child process. Ordinary `rtk <command>` labels remain timed because a zero-input
 /// row can be a real filter that produced no output.
 pub(crate) fn is_timed_command(rtk_cmd: &str) -> bool {
-    !(rtk_cmd == "rtk:passthrough"
+    !(is_legacy_passthrough_command(rtk_cmd)
+        || rtk_cmd == "rtk:passthrough"
         || rtk_cmd.starts_with("rtk:passthrough ")
         || rtk_cmd.starts_with("rtk fallback:")
         || rtk_cmd == "rtk bypass"
@@ -373,12 +374,28 @@ pub(crate) fn is_timed_command(rtk_cmd: &str) -> bool {
         || rtk_cmd.starts_with("rtk proxy "))
 }
 
+/// Labels written by v0.51.0 used an ordinary `rtk` prefix with a standalone
+/// passthrough marker. Keep the marker case-sensitive and token-bounded so an
+/// ordinary label containing similar text remains timed.
+fn is_legacy_passthrough_command(rtk_cmd: &str) -> bool {
+    rtk_cmd.starts_with("rtk ")
+        && rtk_cmd
+            .split_whitespace()
+            .any(|token| token == "(passthrough)" || token == "(Passthrough)")
+}
+
 /// SQL equivalent of [`is_timed_command`] for aggregate queries.
 fn timing_sql(column: &str) -> String {
     format!(
         "CASE WHEN {column} = 'rtk:passthrough' \
                 OR {column} GLOB 'rtk:passthrough *' \
                 OR {column} GLOB 'rtk fallback:*' \
+                OR {column} = 'rtk (passthrough)' \
+                OR {column} GLOB 'rtk * (passthrough)' \
+                OR {column} GLOB 'rtk * (passthrough) *' \
+                OR {column} = 'rtk (Passthrough)' \
+                OR {column} GLOB 'rtk * (Passthrough)' \
+                OR {column} GLOB 'rtk * (Passthrough) *' \
                 OR {column} = 'rtk bypass' \
                 OR {column} GLOB 'rtk bypass *' \
                 OR {column} = 'rtk proxy' \
@@ -2241,9 +2258,9 @@ impl TimedExecution {
     ///
     /// For commands that stream output or run interactively where output
     /// cannot be captured. Records execution time but sets tokens to 0
-    /// (does not dilute savings statistics). The zero input also keeps the
-    /// row out of the `rtk gain` exec-time aggregates, since its duration is
-    /// the wrapped process's lifetime, not filtering work.
+    /// (does not dilute savings statistics). Its canonical stored label keeps
+    /// the row out of the `rtk gain` exec-time aggregates, since its duration
+    /// is the wrapped process's lifetime, not filtering work.
     ///
     /// # Arguments
     ///
@@ -3750,10 +3767,10 @@ mod tests {
         tracker
     }
 
-    // 20. A zero-input row did no filtering, so its wall-clock lifetime must not reach the
-    // exec-time aggregate or its average. Commands and savings still count every row.
+    // 20. An unfiltered lifetime must not reach the exec-time aggregate or its average.
+    // Commands and savings still count every row, regardless of input tokens.
     #[test]
-    fn test_summary_exec_time_excludes_zero_input_rows() {
+    fn test_summary_exec_time_excludes_unfiltered_lifetimes() {
         let summary = tracker_with_interactive_session()
             .get_summary()
             .expect("Failed to get summary");
@@ -3767,7 +3784,7 @@ mod tests {
 
     // 21. The daily / weekly / monthly breakdowns (text, JSON and CSV) apply the same rule.
     #[test]
-    fn test_period_exec_time_excludes_zero_input_rows() {
+    fn test_period_exec_time_excludes_unfiltered_lifetimes() {
         let tracker = tracker_with_interactive_session();
 
         let days = tracker.get_all_days().expect("get_all_days");
@@ -3918,6 +3935,109 @@ mod tests {
         ] {
             assert_eq!(total_time_ms, 42, "{period}: timing classification");
             assert_eq!(avg_time_ms, 14, "{period}: timing average");
+        }
+    }
+
+    #[test]
+    fn test_legacy_passthrough_labels_are_untimed_with_exact_token_boundaries() {
+        let tracker = Tracker::new_in_memory().expect("Failed to create tracker");
+        let untimed = [
+            "rtk git zz (passthrough)",
+            "rtk (passthrough)",
+            "rtk x (passthrough)",
+            "rtk x (passthrough) y",
+            "rtk x (Passthrough)",
+        ];
+        for (index, label) in untimed.iter().enumerate() {
+            assert!(!is_timed_command(label), "{label} should be untimed");
+            tracker
+                .record(
+                    &format!("legacy {index}"),
+                    label,
+                    0,
+                    0,
+                    if *label == "rtk git zz (passthrough)" {
+                        3_002
+                    } else {
+                        100 + index as u64
+                    },
+                )
+                .expect("record legacy passthrough row");
+        }
+
+        for label in [
+            "rtk x (PASSTHROUGH)",
+            "rtk x (passthrough)z",
+            "rtk x(passthrough)",
+        ] {
+            assert!(is_timed_command(label), "{label} should remain timed");
+        }
+
+        let summary = tracker.get_summary().expect("get_summary");
+        assert_eq!(summary.total_commands, untimed.len());
+        assert_eq!(summary.total_time_ms, 0);
+        assert_eq!(summary.avg_time_ms, 0);
+        for label in untimed {
+            let row = summary
+                .by_command
+                .iter()
+                .find(|(command, ..)| command == label)
+                .unwrap_or_else(|| panic!("{label} stats"));
+            assert_eq!(row.4, 0, "{label}: By Command timing");
+        }
+
+        let day = tracker.get_all_days().unwrap();
+        let week = tracker.get_by_week().unwrap();
+        let month = tracker.get_by_month().unwrap();
+        for (period, total_time_ms, avg_time_ms) in [
+            ("day", day[0].total_time_ms, day[0].avg_time_ms),
+            ("week", week[0].total_time_ms, week[0].avg_time_ms),
+            ("month", month[0].total_time_ms, month[0].avg_time_ms),
+        ] {
+            assert_eq!(total_time_ms, 0, "{period}: total exec time");
+            assert_eq!(avg_time_ms, 0, "{period}: average exec time");
+        }
+    }
+
+    #[test]
+    fn test_bypass_and_proxy_rows_with_output_are_untimed_across_aggregates() {
+        let tracker = Tracker::new_in_memory().expect("Failed to create tracker");
+        tracker
+            .record("git status", "rtk git status", 100, 50, 7)
+            .expect("record filtered row");
+        tracker
+            .record("echo hi", "rtk bypass echo hi", 1, 1, 3_002)
+            .expect("record bypass row");
+        tracker
+            .record("git log -20", "rtk proxy git log -20", 4, 4, 4_003)
+            .expect("record proxy row");
+
+        let summary = tracker.get_summary().expect("get_summary");
+        assert_eq!(summary.total_commands, 3);
+        assert_eq!(summary.total_input, 105);
+        assert_eq!(summary.total_output, 55);
+        assert_eq!(summary.total_saved, 50);
+        assert_eq!(summary.total_time_ms, 7);
+        assert_eq!(summary.avg_time_ms, 7);
+        for label in ["rtk bypass echo hi", "rtk proxy git log -20"] {
+            let row = summary
+                .by_command
+                .iter()
+                .find(|(command, ..)| command == label)
+                .unwrap_or_else(|| panic!("{label} stats"));
+            assert_eq!(row.4, 0, "{label}: By Command timing");
+        }
+
+        let day = tracker.get_all_days().unwrap();
+        let week = tracker.get_by_week().unwrap();
+        let month = tracker.get_by_month().unwrap();
+        for (period, total_time_ms, avg_time_ms) in [
+            ("day", day[0].total_time_ms, day[0].avg_time_ms),
+            ("week", week[0].total_time_ms, week[0].avg_time_ms),
+            ("month", month[0].total_time_ms, month[0].avg_time_ms),
+        ] {
+            assert_eq!(total_time_ms, 7, "{period}: total exec time");
+            assert_eq!(avg_time_ms, 7, "{period}: average exec time");
         }
     }
 }

@@ -1949,6 +1949,9 @@ mod tests {
             command_time_label("rtk:passthrough git show HEAD", 1_000),
             "-"
         );
+        assert_eq!(command_time_label("rtk bypass echo hi", 3_002), "-");
+        assert_eq!(command_time_label("rtk proxy git log -20", 4_003), "-");
+        assert_eq!(command_time_label("rtk git zz (passthrough)", 3_002), "-");
         assert_eq!(command_time_label("rtk grep", 0), "0ms");
     }
 }
