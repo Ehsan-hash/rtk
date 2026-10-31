@@ -374,14 +374,10 @@ pub(crate) fn is_timed_command(rtk_cmd: &str) -> bool {
         || rtk_cmd.starts_with("rtk proxy "))
 }
 
-/// Labels written by v0.51.0 used an ordinary `rtk` prefix with a standalone
-/// passthrough marker. Keep the marker case-sensitive and token-bounded so an
-/// ordinary label containing similar text remains timed.
+/// Labels written by v0.51.0 appended a lowercase passthrough suffix.
+/// Similar text in an argument or with different casing remains timed.
 fn is_legacy_passthrough_command(rtk_cmd: &str) -> bool {
-    rtk_cmd.starts_with("rtk ")
-        && rtk_cmd
-            .split_whitespace()
-            .any(|token| token == "(passthrough)" || token == "(Passthrough)")
+    rtk_cmd.starts_with("rtk ") && rtk_cmd.ends_with(" (passthrough)")
 }
 
 /// SQL equivalent of [`is_timed_command`] for aggregate queries.
@@ -392,10 +388,6 @@ fn timing_sql(column: &str) -> String {
                 OR {column} GLOB 'rtk fallback:*' \
                 OR {column} = 'rtk (passthrough)' \
                 OR {column} GLOB 'rtk * (passthrough)' \
-                OR {column} GLOB 'rtk * (passthrough) *' \
-                OR {column} = 'rtk (Passthrough)' \
-                OR {column} GLOB 'rtk * (Passthrough)' \
-                OR {column} GLOB 'rtk * (Passthrough) *' \
                 OR {column} = 'rtk bypass' \
                 OR {column} GLOB 'rtk bypass *' \
                 OR {column} = 'rtk proxy' \
@@ -3945,8 +3937,6 @@ mod tests {
             "rtk git zz (passthrough)",
             "rtk (passthrough)",
             "rtk x (passthrough)",
-            "rtk x (passthrough) y",
-            "rtk x (Passthrough)",
         ];
         for (index, label) in untimed.iter().enumerate() {
             assert!(!is_timed_command(label), "{label} should be untimed");
@@ -3966,11 +3956,22 @@ mod tests {
         }
 
         for label in [
+            "rtk x (passthrough) y",
+            "rtk x (Passthrough)",
+            "rtk x\t(passthrough)",
+            "rtk x\u{a0}(passthrough)",
             "rtk x (PASSTHROUGH)",
             "rtk x (passthrough)z",
             "rtk x(passthrough)",
         ] {
             assert!(is_timed_command(label), "{label} should remain timed");
+            let timed: i64 = tracker
+                .conn
+                .query_row(&format!("SELECT {}", timing_sql("?1")), [label], |row| {
+                    row.get(0)
+                })
+                .expect("SQL classification");
+            assert_eq!(timed, 1, "{label}: SQL should remain timed");
         }
 
         let summary = tracker.get_summary().expect("get_summary");
